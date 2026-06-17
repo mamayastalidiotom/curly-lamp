@@ -553,6 +553,12 @@ async def manual_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 async def switch_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Малыш, что курим?", reply_markup=type_inline())
+
+
+# ─────────────────────────────────────────────
+# ЭЛЕКТРОНКА — затяжка
+# ─────────────────────────────────────────────
+async def vape_puff_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("💨 Сколько затяжек сделала?\nВведи число:")
     return WAITING_PUFFS_ADD
 
