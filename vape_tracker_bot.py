@@ -537,14 +537,22 @@ async def choose_type_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
 
-async def switch_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Малыш, что курим?", reply_markup=type_inline())
+async def manual_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    data = load_data(user_id)
+    if not data:
+        await update.message.reply_text("Сначала выбери режим через /start")
+        return
+    await update.message.reply_text("Готовлю отчёт... ⏳")
+    msg = await generate_morning_message(data)
+    await update.message.reply_text(f"🌅 {msg}")
 
 
 # ─────────────────────────────────────────────
 # ЭЛЕКТРОНКА — затяжка
 # ─────────────────────────────────────────────
-async def vape_puff_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def switch_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Малыш, что курим?", reply_markup=type_inline())
     await update.message.reply_text("💨 Сколько затяжек сделала?\nВведи число:")
     return WAITING_PUFFS_ADD
 
@@ -1007,6 +1015,7 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("report", manual_report))
     app.add_handler(puff_conv)
     app.add_handler(device_conv)
     app.add_handler(cig_conv)
