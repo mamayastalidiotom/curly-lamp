@@ -3,6 +3,7 @@ import json
 import os
 import httpx
 from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -13,6 +14,8 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
+MOSCOW = ZoneInfo("Europe/Moscow")
 
 # ─────────────────────────────────────────────
 # НАСТРОЙКИ
@@ -30,7 +33,8 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
     WAITING_PUFFS_ADD,
     WAITING_LIMIT,
     WAITING_CUSTOM_TRIGGER,
-) = range(6)
+    WAITING_STATUS,
+) = range(7)
 
 # Базовые триггеры — причины почему закурила
 DEFAULT_TRIGGERS = [
@@ -78,6 +82,9 @@ def load_all_users() -> dict:
 def new_vape_data() -> dict:
     return {
         "type": "vape",
+        "status": None,          # "smoking" | "reducing" | "quitting"
+        "status_set_at": None,   # когда установлен (для подсчёта дней без курения)
+        "fact_sent_date": None,  # когда последний раз отправляли факт
         "total_puffs": 0,
         "today_puffs": 0,
         "today_date": str(date.today()),
@@ -85,8 +92,8 @@ def new_vape_data() -> dict:
         "current_device": {"total_puffs": None, "used_puffs": 0, "bought_at": None},
         "last_puff_at": None,
         "history": [],
-        "daily_history": {},  # {"2024-01-01": 180, ...}
-        "events": {},  # {"2024-01-01": [{"time": "13:05:23", "count": 1, "triggers": [...]}, ...]}
+        "daily_history": {},
+        "events": {},
         "custom_triggers": [],
         "daily_limit": None,
         "limit_warned": False,
@@ -96,6 +103,9 @@ def new_vape_data() -> dict:
 def new_cig_data() -> dict:
     return {
         "type": "cigarettes",
+        "status": None,
+        "status_set_at": None,
+        "fact_sent_date": None,
         "total_cigarettes": 0,
         "today_cigarettes": 0,
         "today_date": str(date.today()),
@@ -225,9 +235,9 @@ def build_trigger_keyboard(data: dict, selected: set, all_triggers: list = None)
 # ─────────────────────────────────────────────
 # Claude API
 # ─────────────────────────────────────────────
-async def ask_claude(prompt: str) -> str:
+async def ask_claude(prompt: str) -> str | None:
     if not ANTHROPIC_API_KEY:
-        return prompt  # Если ключа нет — возвращаем сырые данные
+        return None
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -238,7 +248,7 @@ async def ask_claude(prompt: str) -> str:
                     "content-type": "application/json",
                 },
                 json={
-                    "model": "claude-sonnet-4-20250514",
+                    "model": "claude-sonnet-4-6",
                     "max_tokens": 200,
                     "messages": [{"role": "user", "content": prompt}],
                 },
@@ -248,7 +258,7 @@ async def ask_claude(prompt: str) -> str:
             return result["content"][0]["text"]
     except Exception as e:
         logging.error(f"Claude API error: {e}")
-        return prompt
+        return None
 
 
 async def generate_morning_message(data: dict) -> str:
@@ -266,7 +276,16 @@ async def generate_morning_message(data: dict) -> str:
         f"{triggers_str}. "
         f"Тон дружелюбный, немного с юмором. Без хэштегов. Не повторяй шаблонные фразы."
     )
-    return await ask_claude(prompt)
+    result = await ask_claude(prompt)
+    if result:
+        return result
+    # Простой fallback без Claude
+    parts = [f"Вчера: {yesterday} {unit}"]
+    if diff_str:
+        parts.append(diff_str)
+    if triggers_str:
+        parts.append(triggers_str)
+    return " | ".join(parts)
 
 
 async def generate_weekly_message(data: dict) -> str:
@@ -281,7 +300,12 @@ async def generate_weekly_message(data: dict) -> str:
         f"За неделю: {stats['total']} {unit}, самый активный день — {max_day_fmt} ({stats['max_val']} {unit}), "
         f"среднее в день: {stats['avg']}. {triggers_str}. Тон дружелюбный. Без хэштегов."
     )
-    return await ask_claude(prompt)
+    result = await ask_claude(prompt)
+    if result:
+        return result
+    return (f"За неделю: {stats['total']} {unit}. "
+            f"Самый активный день: {max_day_fmt} ({stats['max_val']}). "
+            f"Среднее: {stats['avg']}/день. {triggers_str}")
 
 
 async def generate_monthly_message(data: dict) -> str:
@@ -300,20 +324,29 @@ async def generate_monthly_message(data: dict) -> str:
         f"Всего: {stats['total']} {unit}, рекордный день — {max_day_fmt} ({stats['max_val']}), "
         f"лучший день — {min_day_fmt} ({stats['min_val']}). {triggers_str}. Тон поддерживающий. Без хэштегов."
     )
-    return await ask_claude(prompt)
+    result = await ask_claude(prompt)
+    if result:
+        return result
+    return (f"За {stats['month_name']}: {stats['total']} {unit}. "
+            f"Рекордный день: {max_day_fmt} ({stats['max_val']}). "
+            f"Лучший день: {min_day_fmt} ({stats['min_val']}). {triggers_str}")
 
 
 async def generate_limit_warning(data: dict, percent: int) -> str:
     unit = "затяжек" if data["type"] == "vape" else "сигарет"
     limit = data["daily_limit"]
     current = get_today_count(data)
-
     prompt = (
         f"Напиши короткое предупреждение (1-2 предложения) — человек {'достиг' if percent == 100 else 'приближается к'} "
         f"дневному лимиту курения. Лимит: {limit} {unit}, сейчас: {current}. "
         f"Тон {'мягкий, но серьёзный' if percent == 100 else 'предупредительный'}. Без хэштегов."
     )
-    return await ask_claude(prompt)
+    result = await ask_claude(prompt)
+    if result:
+        return result
+    if percent >= 100:
+        return f"Лимит {limit} {unit} исчерпан. Сегодня уже {current}."
+    return f"Осторожно — уже {current} из {limit} {unit} на сегодня."
 
 
 async def generate_pace_message(data: dict, diff: int, percent: int) -> str:
@@ -323,17 +356,29 @@ async def generate_pace_message(data: dict, diff: int, percent: int) -> str:
         f"К этому моменту дня уже на {diff} {unit} больше чем вчера в это же время "
         f"(это на {percent}% больше). Тон лёгкий, без морализаторства, можно с долей иронии. Без хэштегов."
     )
-    return await ask_claude(prompt)
+    result = await ask_claude(prompt)
+    if result:
+        return result
+    return f"К этому времени уже на {diff} {unit} больше чем вчера ({percent}% сверх нормы)."
 
 
 # ─────────────────────────────────────────────
 # Клавиатуры
 # ─────────────────────────────────────────────
+def status_inline():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🚬 Курю", callback_data="status_smoking"),
+        InlineKeyboardButton("📉 Снижаю", callback_data="status_reducing"),
+        InlineKeyboardButton("🏁 Бросаю", callback_data="status_quitting"),
+    ]])
+
+
 def vape_keyboard():
     return ReplyKeyboardMarkup([
         ["💨 Затяжка", "🔋 Новая электронка"],
         ["📊 Статистика", "⏱ Последняя затяжка"],
-        ["🎯 Лимит дня", "🔄 Сменить режим"],
+        ["🎯 Лимит дня", "⚙️ Настройки"],
+        ["🔄 Сменить режим"],
     ], resize_keyboard=True)
 
 
@@ -341,7 +386,8 @@ def cig_keyboard():
     return ReplyKeyboardMarkup([
         ["🚬 Покурила", "📦 Новая пачка"],
         ["📊 Статистика", "⏱ Последний раз"],
-        ["🎯 Лимит дня", "🔄 Сменить режим"],
+        ["🎯 Лимит дня", "⚙️ Настройки"],
+        ["🔄 Сменить режим"],
     ], resize_keyboard=True)
 
 
@@ -972,15 +1018,15 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^⏱ (Последняя затяжка|Последний раз)$"), last_time))
     app.add_handler(MessageHandler(filters.Regex("^🔄 Сменить режим$"), switch_mode))
 
-    # Расписание — каждый день в 9:00
+    # Расписание — каждый день в 9:00 по Москве
     job_queue = app.job_queue
-    job_queue.run_daily(send_morning_reports, time=datetime.strptime("09:00", "%H:%M").time())
-    job_queue.run_daily(send_weekly_reports, time=datetime.strptime("09:00", "%H:%M").time())
-    job_queue.run_daily(send_monthly_reports, time=datetime.strptime("09:00", "%H:%M").time())
+    job_queue.run_daily(send_morning_reports, time=datetime.strptime("09:00", "%H:%M").time().replace(tzinfo=MOSCOW))
+    job_queue.run_daily(send_weekly_reports, time=datetime.strptime("09:00", "%H:%M").time().replace(tzinfo=MOSCOW))
+    job_queue.run_daily(send_monthly_reports, time=datetime.strptime("09:00", "%H:%M").time().replace(tzinfo=MOSCOW))
 
-    # Сравнение с прошлым днём — 3 раза в день
+    # Сравнение с прошлым днём — 3 раза в день по Москве
     for t in ["13:00", "18:00", "22:00"]:
-        job_queue.run_daily(send_pace_checks, time=datetime.strptime(t, "%H:%M").time())
+        job_queue.run_daily(send_pace_checks, time=datetime.strptime(t, "%H:%M").time().replace(tzinfo=MOSCOW))
 
     print("✅ Бот запущен!")
     app.run_polling()
